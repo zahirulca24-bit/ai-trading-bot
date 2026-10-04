@@ -1,0 +1,5 @@
+﻿flask
+groq
+pybit
+python-dotenv
+requests
