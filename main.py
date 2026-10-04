@@ -34,9 +34,9 @@ MAX_OPEN_POSITIONS = 3
 DAILY_LOSS_LIMIT_PCT = 10.0
 LEVERAGE = 3
 
-# ??? ?????
-POSITION_CHECK_INTERVAL_SEC = 300   # 5 ????? — ???? position management
-AI_CYCLE_INTERVAL_SEC = 900         # 15 ????? — AI ???????? + ???? ?????
+# Dual speed intervals
+POSITION_CHECK_INTERVAL_SEC = 300   # 5 min - position management only
+AI_CYCLE_INTERVAL_SEC = 900         # 15 min - AI signals + new trades
 
 SL_PCT = 0.008
 TP_PCT = 0.016
@@ -273,11 +273,104 @@ def place_order(t):
         return {"ok": False, "error": str(e)[:80]}
 
 
+
+def place_order_with_tps(t):
+    """
+    Market entry + SL + 3 limit TPs (reduceOnly)
+    TP1 @ 1:1 = 40%, TP2 @ 1.5:1 = 30%, TP3 @ 2:1 = 30%
+    """
+    symbol = t["symbol"]
+    side = t["bias"]
+    entry = t["entry"]
+    sl = t["sl"]
+    qty = t["qty"]
+    tick = t["tickSize"]
+    step = t["qtyStep"]
+
+    buy_side = "Buy" if side == "long" else "Sell"
+    close_side = "Sell" if side == "long" else "Buy"
+
+    risk = abs(entry - sl)
+    if risk <= 0:
+        return {"ok": False, "error": "invalid risk"}
+
+    # Calculate TP levels
+    if side == "long":
+        tp1 = round_step(entry + risk * 1.0, tick)
+        tp2 = round_step(entry + risk * 1.5, tick)
+        tp3 = round_step(entry + risk * 2.0, tick)
+    else:
+        tp1 = round_step(entry - risk * 1.0, tick)
+        tp2 = round_step(entry - risk * 1.5, tick)
+        tp3 = round_step(entry - risk * 2.0, tick)
+
+    # Split Qty
+    info = get_instrument_info(symbol)
+    if not info:
+        return {"ok": False, "error": "no instrument info"}
+
+    qty1 = round_step(qty * 0.40, step)
+    qty2 = round_step(qty * 0.30, step)
+    qty3 = round_step(qty - qty1 - qty2, step)
+
+    # Min check
+    if qty1 < info["minOrderQty"] or qty2 < info["minOrderQty"] or qty3 < info["minOrderQty"]:
+        # If split qty too small, fallback to single TP
+        log(f"{symbol}: TPs too small for split, using single TP")
+        return place_order(t)
+
+    try:
+        # 1. Entry + SL (main position)
+        r = session.place_order(
+            category="linear",
+            symbol=symbol,
+            side=buy_side,
+            orderType="Market",
+            qty=format_qty(qty, step),
+            stopLoss=format_price(sl, tick),
+            slTriggerBy="LastPrice",
+            timeInForce="IOC",
+        )
+        if r["retCode"] != 0:
+            return {"ok": False, "error": r["retMsg"]}
+
+        order_id = r["result"]["orderId"]
+
+        # 2. Set TP limit orders (reduceOnly)
+        tp_results = []
+        for label, tp_price, tp_qty in [
+            ("TP1", tp1, qty1),
+            ("TP2", tp2, qty2),
+            ("TP3", tp3, qty3),
+        ]:
+            time.sleep(0.25)
+            tr = session.place_order(
+                category="linear",
+                symbol=symbol,
+                side=close_side,
+                orderType="Limit",
+                qty=format_qty(tp_qty, step),
+                price=format_price(tp_price, tick),
+                reduceOnly=True,
+                timeInForce="GTC",
+            )
+            if tr["retCode"] == 0:
+                tp_results.append(f"{label}={format_price(tp_price, tick)} qty={format_qty(tp_qty, step)}")
+            else:
+                tp_results.append(f"{label}=FAIL({tr['retMsg'][:30]})")
+
+        log(f"{symbol}: TPs set -> {' | '.join(tp_results)}")
+        return {"ok": True, "order_id": order_id, "tps": tp_results}
+
+    except Exception as e:
+        return {"ok": False, "error": str(e)[:80]}
+
+
 # ========================================================
-# Position Check — ????? ? ??????
+# Position Check - every 5 minutes
 # ========================================================
 def position_check():
-    """???? position management — TP1 hit? SL ????? ????"""
+    """Position management - TP1 hit? Move SL to breakeven"""
     try:
         manage_positions(log_func=log)
     except Exception as e:
@@ -285,10 +378,10 @@ def position_check():
 
 
 # ========================================================
-# AI Cycle — ????? ?? ??????
+# AI Cycle - every 15 minutes
 # ========================================================
 def ai_cycle():
-    """AI ???????? + ???? ?????"""
+    """AI signals + new trades"""
     log("=" * 50)
     log("AI Cycle started")
 
@@ -395,7 +488,7 @@ def ai_cycle():
     log("AI Cycle ended")
 
 
-# backward-compat: ????? ???
+# backward-compat
 def run_once():
     position_check()
     ai_cycle()
@@ -420,10 +513,10 @@ def main():
         try:
             now = time.time()
 
-            # ?. ?????? position check (? ??????)
+            # 1. Position check (every 5 mins)
             position_check()
 
-            # ?. AI cycle ???? ?? ????? ???
+            # 2. AI cycle (every 15 mins)
             if now - last_ai >= AI_CYCLE_INTERVAL_SEC:
                 ai_cycle()
                 last_ai = now
@@ -449,94 +542,3 @@ if __name__ == "__main__":
         position_check()
     else:
         main()
-def place_order_with_tps(t):
-    """
-    Market entry + SL + 3 limit TPs (reduceOnly)?
-    TP1 @ 1:1 = 40%, TP2 @ 1.5:1 = 30%, TP3 @ 2:1 = 30%
-    """
-    symbol = t["symbol"]
-    side = t["bias"]
-    entry = t["entry"]
-    sl = t["sl"]
-    qty = t["qty"]
-    tick = t["tickSize"]
-    step = t["qtyStep"]
-
-    buy_side = "Buy" if side == "long" else "Sell"
-    close_side = "Sell" if side == "long" else "Buy"
-
-    risk = abs(entry - sl)
-    if risk <= 0:
-        return {"ok": False, "error": "invalid risk"}
-
-    # TP ?????
-    if side == "long":
-        tp1 = round_step(entry + risk * 1.0, tick)
-        tp2 = round_step(entry + risk * 1.5, tick)
-        tp3 = round_step(entry + risk * 2.0, tick)
-    else:
-        tp1 = round_step(entry - risk * 1.0, tick)
-        tp2 = round_step(entry - risk * 1.5, tick)
-        tp3 = round_step(entry - risk * 2.0, tick)
-
-    # Qty ???
-    info = get_instrument_info(symbol)
-    if not info:
-        return {"ok": False, "error": "no instrument info"}
-
-    qty1 = round_step(qty * 0.40, step)
-    qty2 = round_step(qty * 0.30, step)
-    qty3 = round_step(qty - qty1 - qty2, step)
-
-    # Min check
-    if qty1 < info["minOrderQty"] or qty2 < info["minOrderQty"] or qty3 < info["minOrderQty"]:
-        # TP ??? ??? single TP fallback
-        log(f"{symbol}: TPs too small for split, using single TP")
-        return place_order(t)
-
-    try:
-        # 1. Entry + SL (main position)
-        r = session.place_order(
-            category="linear",
-            symbol=symbol,
-            side=buy_side,
-            orderType="Market",
-            qty=format_qty(qty, step),
-            stopLoss=format_price(sl, tick),
-            slTriggerBy="LastPrice",
-            timeInForce="IOC",
-        )
-        if r["retCode"] != 0:
-            return {"ok": False, "error": r["retMsg"]}
-
-        order_id = r["result"]["orderId"]
-
-        # 2. ????? TP limit order (reduceOnly)
-        tp_results = []
-        for label, tp_price, tp_qty in [
-            ("TP1", tp1, qty1),
-            ("TP2", tp2, qty2),
-            ("TP3", tp3, qty3),
-        ]:
-            time.sleep(0.25)
-            tr = session.place_order(
-                category="linear",
-                symbol=symbol,
-                side=close_side,
-                orderType="Limit",
-                qty=format_qty(tp_qty, step),
-                price=format_price(tp_price, tick),
-                reduceOnly=True,
-                timeInForce="GTC",
-            )
-            if tr["retCode"] == 0:
-                tp_results.append(f"{label}={format_price(tp_price, tick)} qty={format_qty(tp_qty, step)}")
-            else:
-                tp_results.append(f"{label}=FAIL({tr['retMsg'][:30]})")
-
-        log(f"{symbol}: TPs set -> {' | '.join(tp_results)}")
-        return {"ok": True, "order_id": order_id, "tps": tp_results}
-
-    except Exception as e:
-        return {"ok": False, "error": str(e)[:80]}
-
