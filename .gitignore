@@ -1,3 +1,10 @@
 .env
 .local secrate.txt
 tp1_hit.json
+pm_state.json
+bot.log
+signals.json
+state.json
+trades.json
+__pycache__/
+*.pyc
