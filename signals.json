@@ -1,0 +1,130 @@
+{
+  "BTCUSDT": {
+    "price": 85356.7,
+    "rsi_15m": 60.25,
+    "change_24h": 0.62,
+    "funding_rate": 0.005,
+    "groq": {
+      "bias": "neutral",
+      "confidence": 55,
+      "reason": "RSI 60.25 is neutral, no extreme signals, low conviction"
+    },
+    "gemini": {
+      "bias": "long",
+      "confidence": 65,
+      "reason": "RSI at 60.25 shows healthy bullish momentum with room to expand before reaching overbought territory, supported by a neu"
+    },
+    "consensus": {
+      "bias": "neutral",
+      "confidence": 0,
+      "reason": "disagreement: {'long': 1, 'short': 0, 'neutral': 1}",
+      "votes": {
+        "long": 1,
+        "short": 0,
+        "neutral": 1
+      },
+      "providers": {
+        "groq": "neutral",
+        "gemini": "long"
+      },
+      "price": 85356.7,
+      "rsi_15m": 60.25
+    }
+  },
+  "ETHUSDT": {
+    "price": 2701.99,
+    "rsi_15m": 62.48,
+    "change_24h": 0.77,
+    "funding_rate": 0.0086,
+    "groq": {
+      "bias": "neutral",
+      "confidence": 55,
+      "reason": "RSI 62.48 is neutral and 24h change is mild; no strong intraday edge."
+    },
+    "gemini": {
+      "bias": "long",
+      "confidence": 65,
+      "reason": "RSI at 62.48 indicates strong intraday bullish momentum with room to extend gains before reaching the 70 overbought thre"
+    },
+    "consensus": {
+      "bias": "neutral",
+      "confidence": 0,
+      "reason": "disagreement: {'long': 1, 'short': 0, 'neutral': 1}",
+      "votes": {
+        "long": 1,
+        "short": 0,
+        "neutral": 1
+      },
+      "providers": {
+        "groq": "neutral",
+        "gemini": "long"
+      },
+      "price": 2701.99,
+      "rsi_15m": 62.48
+    }
+  },
+  "SOLUSDT": {
+    "price": 121.68,
+    "rsi_15m": 52.36,
+    "change_24h": 1.62,
+    "funding_rate": 0.01,
+    "groq": {
+      "bias": "neutral",
+      "confidence": 55,
+      "reason": "RSI neutral at 52.36 and low funding rate indicate no strong directional edge"
+    },
+    "gemini": {
+      "bias": "neutral",
+      "confidence": 50,
+      "reason": "RSI at 52.36 indicates neutral momentum, funding rate is at baseline, and price action lacks a strong breakout trigger."
+    },
+    "consensus": {
+      "bias": "neutral",
+      "confidence": 52,
+      "reason": "all neutral: groq:RSI neutral at 52.36 and low f | gemini:RSI at 52.36 indicates neutral",
+      "votes": {
+        "long": 0,
+        "short": 0,
+        "neutral": 2
+      },
+      "providers": {
+        "groq": "neutral",
+        "gemini": "neutral"
+      },
+      "price": 121.68,
+      "rsi_15m": 52.36
+    }
+  },
+  "BNBUSDT": {
+    "price": 788.5,
+    "rsi_15m": 44.59,
+    "change_24h": 0.29,
+    "funding_rate": 0.0021,
+    "groq": {
+      "bias": "neutral",
+      "confidence": 50,
+      "reason": "RSI 44.59 is neutral, 24h change minimal, no strong intraday momentum"
+    },
+    "gemini": {
+      "bias": "neutral",
+      "confidence": 50,
+      "reason": "RSI is in a neutral range at 44.59 with flat 24h price action indicating market consolidation and lack of intraday momen"
+    },
+    "consensus": {
+      "bias": "neutral",
+      "confidence": 50,
+      "reason": "all neutral: groq:RSI 44.59 is neutral, 24h chan | gemini:RSI is in a neutral range at 4",
+      "votes": {
+        "long": 0,
+        "short": 0,
+        "neutral": 2
+      },
+      "providers": {
+        "groq": "neutral",
+        "gemini": "neutral"
+      },
+      "price": 788.5,
+      "rsi_15m": 44.59
+    }
+  }
+}

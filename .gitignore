@@ -1,8 +1,2 @@
-﻿venv/
 .env
-__pycache__/
-*.pyc
-bot.log
-state.json
-signals.json
-trades.json
+.local secrate.txt
