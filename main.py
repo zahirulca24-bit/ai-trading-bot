@@ -15,6 +15,7 @@ from telegram_bot import (
     alert_error,
     send_message,
 )
+from position_manager import manage_positions
 
 load_dotenv()
 
@@ -32,7 +33,11 @@ MIN_CONSENSUS_CONFIDENCE = 60
 MAX_OPEN_POSITIONS = 3
 DAILY_LOSS_LIMIT_PCT = 10.0
 LEVERAGE = 3
-LOOP_INTERVAL_SEC = 900
+
+# দুই স্পিড
+POSITION_CHECK_INTERVAL_SEC = 300   # 5 মিনিট — শুধু position management
+AI_CYCLE_INTERVAL_SEC = 900         # 15 মিনিট — AI সিগন্যাল + নতুন ট্রেড
+
 SL_PCT = 0.008
 TP_PCT = 0.016
 
@@ -268,14 +273,29 @@ def place_order(t):
         return {"ok": False, "error": str(e)[:80]}
 
 
-def run_once():
+# ========================================================
+# Position Check — প্রতি ৫ মিনিটে
+# ========================================================
+def position_check():
+    """শুধু position management — TP1 hit? SL সরাতে হবে?"""
+    try:
+        manage_positions(log_func=log)
+    except Exception as e:
+        log(f"position manager error: {str(e)[:80]}")
+
+
+# ========================================================
+# AI Cycle — প্রতি ১৫ মিনিটে
+# ========================================================
+def ai_cycle():
+    """AI সিগন্যাল + নতুন ট্রেড"""
     log("=" * 50)
-    log("Cycle started (multi-AI consensus)")
+    log("AI Cycle started")
 
     state = load_state()
     balance = get_balance()
     if balance is None:
-        log("balance fetch failed, skip cycle")
+        log("balance fetch failed, skip AI cycle")
         return
 
     if state["start_balance"] is None:
@@ -372,37 +392,60 @@ def run_once():
     with open("signals.json", "w") as f:
         json.dump(signals_snapshot, f, indent=2, default=str)
 
-    log("Cycle ended")
+    log("AI Cycle ended")
+
+
+# backward-compat: পুরনো নাম
+def run_once():
+    position_check()
+    ai_cycle()
 
 
 def main():
     log("=" * 50)
-    log("BOT STARTED (multi-AI consensus mode)")
+    log("BOT STARTED (5m position check + 15m AI cycle)")
     log(f"Coins: {COINS}")
     log(f"Risk/trade: {RISK_PER_TRADE_PCT}% | Max positions: {MAX_OPEN_POSITIONS}")
-    log(f"Min consensus confidence: {MIN_CONSENSUS_CONFIDENCE}%")
-    log(f"Loop interval: {LOOP_INTERVAL_SEC}s")
+    log(f"Position check: every {POSITION_CHECK_INTERVAL_SEC}s ({POSITION_CHECK_INTERVAL_SEC//60}m)")
+    log(f"AI cycle: every {AI_CYCLE_INTERVAL_SEC}s ({AI_CYCLE_INTERVAL_SEC//60}m)")
 
     try:
-        send_message("BOT STARTED\n\nMulti-AI consensus mode active.")
+        send_message("BOT STARTED\n\n5m position check + 15m AI cycle")
     except Exception:
         pass
 
+    last_ai = 0
+
     while True:
         try:
-            run_once()
+            now = time.time()
+
+            # ১. সবসময় position check (৫ মিনিটে)
+            position_check()
+
+            # ২. AI cycle শুধু ১৫ মিনিট হলে
+            if now - last_ai >= AI_CYCLE_INTERVAL_SEC:
+                ai_cycle()
+                last_ai = now
+            else:
+                log(f"Position check only. Next AI cycle in {int(AI_CYCLE_INTERVAL_SEC - (now - last_ai))}s")
+
         except KeyboardInterrupt:
             log("Stopped by user")
             break
         except Exception as e:
-            log(f"Cycle error: {str(e)[:120]}")
-        log(f"Sleeping {LOOP_INTERVAL_SEC}s...")
-        time.sleep(LOOP_INTERVAL_SEC)
+            log(f"Loop error: {str(e)[:120]}")
+
+        log(f"Sleeping {POSITION_CHECK_INTERVAL_SEC}s...")
+        time.sleep(POSITION_CHECK_INTERVAL_SEC)
 
 
 if __name__ == "__main__":
     import sys
     if len(sys.argv) > 1 and sys.argv[1] == "once":
-        run_once()
+        position_check()
+        ai_cycle()
+    elif len(sys.argv) > 1 and sys.argv[1] == "position":
+        position_check()
     else:
         main()
