@@ -1,5 +1,7 @@
 ﻿flask
+gunicorn
 groq
+google-genai
 pybit
 python-dotenv
 requests

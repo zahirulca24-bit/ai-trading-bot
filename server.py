@@ -5,19 +5,24 @@ import datetime
 from flask import Flask, jsonify
 
 from main import run_once, get_balance, get_open_positions, log
+from telegram_bot import send_message
 
 app = Flask(__name__)
 
 BOT_THREAD = None
 BOT_RUNNING = False
 LAST_CYCLE = None
-LOOP_INTERVAL = 900  # 15 মিনিট
+LOOP_INTERVAL = 900
 
 
 def bot_loop():
     global BOT_RUNNING, LAST_CYCLE
     BOT_RUNNING = True
     log("Background bot thread started")
+    try:
+        send_message("BOT STARTED (Render)\n\nMulti-AI consensus mode active.")
+    except Exception:
+        pass
 
     while True:
         try:
@@ -71,7 +76,6 @@ def status():
 
 @app.route("/trigger")
 def trigger():
-    """ম্যানুয়ালি একটা সাইকেল চালাও (টেস্টের জন্য)"""
     try:
         threading.Thread(target=run_once, daemon=True).start()
         return jsonify({"ok": True, "message": "cycle triggered"})
@@ -84,5 +88,4 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
 else:
-    # Render-এ gunicorn দিয়ে চালালেও bot thread শুরু হবে
     start_bot()

@@ -1,13 +1,20 @@
 ﻿import os
 import json
 import time
-import math
 import datetime
 from pathlib import Path
 
 from dotenv import load_dotenv
 from pybit.unified_trading import HTTP
-from groq import Groq
+
+from ai_providers import get_all_signals
+from consensus import consensus
+from telegram_bot import (
+    alert_trade_opened,
+    alert_cycle_summary,
+    alert_error,
+    send_message,
+)
 
 load_dotenv()
 
@@ -17,13 +24,11 @@ session = HTTP(
     api_key=os.getenv("BYBIT_API_KEY"),
     api_secret=os.getenv("BYBIT_API_SECRET"),
 )
-groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
 COINS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT"]
-MODELS = ["openai/gpt-oss-120b", "qwen/qwen3.8-27b"]
 
 RISK_PER_TRADE_PCT = 2.0
-MIN_CONFIDENCE = 60
+MIN_CONSENSUS_CONFIDENCE = 60
 MAX_OPEN_POSITIONS = 3
 DAILY_LOSS_LIMIT_PCT = 10.0
 LEVERAGE = 3
@@ -64,7 +69,6 @@ def save_state(s):
 
 
 def get_instrument_info(symbol):
-    """Bybit থেকে qtyStep, minOrderQty, tickSize, minNotional আনো (cached)"""
     if symbol in INSTRUMENT_CACHE:
         return INSTRUMENT_CACHE[symbol]
     try:
@@ -88,7 +92,6 @@ def get_instrument_info(symbol):
 
 
 def decimals_from_step(step):
-    """step থেকে দশমিকের সংখ্যা বের করো"""
     s = f"{step:.10f}".rstrip("0")
     if "." in s:
         return len(s.split(".")[1])
@@ -96,7 +99,6 @@ def decimals_from_step(step):
 
 
 def round_step(value, step):
-    """value-কে step-এর নিকটতম গুণিতকে round করো"""
     if step <= 0:
         return value
     d = decimals_from_step(step)
@@ -104,13 +106,11 @@ def round_step(value, step):
 
 
 def format_qty(qty, step):
-    """qty-কে string-এ রূপান্তর, step-এর precision মেনে"""
     d = decimals_from_step(step)
     return f"{round_step(qty, step):.{d}f}"
 
 
 def format_price(price, tick):
-    """price-কে tick-এর গুণিতকে round করে string"""
     d = decimals_from_step(tick)
     return f"{round_step(price, tick):.{d}f}"
 
@@ -175,79 +175,16 @@ def get_market_data(symbol):
         return None
 
 
-def extract_json(text):
-    if not text:
-        raise ValueError("empty")
-    text = text.strip()
-    if "```" in text:
-        for p in text.split("```"):
-            p = p.replace("json", "").strip()
-            if p.startswith("{"):
-                text = p
-                break
-    try:
-        return json.loads(text)
-    except Exception:
-        pass
-    start = text.find("{")
-    if start != -1:
-        depth = 0
-        for i in range(start, len(text)):
-            if text[i] == "{":
-                depth += 1
-            elif text[i] == "}":
-                depth -= 1
-                if depth == 0:
-                    try:
-                        return json.loads(text[start:i+1])
-                    except Exception:
-                        break
-    raise ValueError(f"no json: {text[:60]}")
-
-
-def get_ai_signal(symbol, data):
-    prompt = f"""You are a professional crypto intraday trader.
-Analyze this 15-minute data and give ONE trading signal.
-
-Symbol: {symbol}
-Price: {data['price']}
-24h Change: {data['change_24h']}%
-Funding Rate: {data['funding_rate']}%
-RSI (15m): {data['rsi_15m']}
-
-Rules:
-- Confidence below 60 -> bias must be "neutral"
-- RSI > 70 -> consider short
-- RSI < 30 -> consider long
-
-Output a single JSON object on ONE line. No markdown.
-Format: {{"bias": "long", "confidence": 72, "reason": "short text"}}
-"""
-    for model in MODELS:
-        for attempt in range(2):
-            try:
-                r = groq_client.chat.completions.create(
-                    model=model,
-                    messages=[
-                        {"role": "system", "content": "Reply ONLY with single-line JSON object."},
-                        {"role": "user", "content": prompt},
-                    ],
-                    temperature=0.1,
-                    max_tokens=200,
-                )
-                return extract_json(r.choices[0].message.content)
-            except Exception:
-                continue
-    return {"bias": "neutral", "confidence": 0, "reason": "ai unavailable"}
-
-
 def calculate_position(symbol, signal, balance):
-    """Position হিসাব + symbol-এর step মেনে round"""
     bias = signal.get("bias")
     confidence = signal.get("confidence", 0)
     entry = signal.get("price")
 
-    if bias not in ("long", "short") or confidence < MIN_CONFIDENCE or not entry:
+    if bias not in ("long", "short"):
+        return None
+    if confidence < MIN_CONSENSUS_CONFIDENCE:
+        return None
+    if not entry:
         return None
 
     info = get_instrument_info(symbol)
@@ -262,7 +199,6 @@ def calculate_position(symbol, signal, balance):
         sl = entry * (1 + SL_PCT)
         tp = entry * (1 - TP_PCT)
 
-    # দাম tickSize মেনে round করো
     sl = round_step(sl, info["tickSize"])
     tp = round_step(tp, info["tickSize"])
 
@@ -271,18 +207,14 @@ def calculate_position(symbol, signal, balance):
     if price_risk <= 0:
         return None
 
-    # qty হিসাব + qtyStep মেনে round
     raw_qty = risk_usd / price_risk
     qty = round_step(raw_qty, info["qtyStep"])
 
-    # minOrderQty চেক
     if qty < info["minOrderQty"]:
         qty = info["minOrderQty"]
         log(f"{symbol}: qty raised to minOrderQty {info['minOrderQty']}")
 
     notional = qty * entry
-
-    # minNotionalValue চেক
     if notional < info["minNotional"]:
         log(f"{symbol}: notional ${notional:.2f} < ${info['minNotional']}, skip")
         return None
@@ -338,7 +270,7 @@ def place_order(t):
 
 def run_once():
     log("=" * 50)
-    log("Cycle started")
+    log("Cycle started (multi-AI consensus)")
 
     state = load_state()
     balance = get_balance()
@@ -355,6 +287,11 @@ def run_once():
 
     if daily_pnl_pct <= -DAILY_LOSS_LIMIT_PCT:
         log(f"Daily loss limit hit ({daily_pnl_pct:.2f}%), skip")
+        try:
+            msg = "KILL SWITCH\n\nDaily loss limit hit: " + f"{daily_pnl_pct:.2f}%"
+            send_message(msg)
+        except Exception:
+            pass
         return
 
     positions = get_open_positions()
@@ -363,6 +300,8 @@ def run_once():
     if len(positions) >= MAX_OPEN_POSITIONS:
         log("Max positions reached, skip new trades")
         return
+
+    signals_snapshot = {}
 
     for symbol in COINS:
         if symbol in positions:
@@ -374,13 +313,28 @@ def run_once():
             log(f"{symbol}: no data")
             continue
 
-        signal = get_ai_signal(symbol, data)
-        signal["price"] = data["price"]
-        bias = signal.get("bias", "?")
-        conf = signal.get("confidence", 0)
-        log(f"{symbol}: {bias} ({conf}%) - {signal.get('reason', '')[:50]}")
+        raw_signals = get_all_signals(symbol, data)
+        result = consensus(raw_signals)
+        result["price"] = data["price"]
+        result["rsi_15m"] = data["rsi_15m"]
 
-        trade = calculate_position(symbol, signal, balance)
+        signals_snapshot[symbol] = {
+            "price": data["price"],
+            "rsi_15m": data["rsi_15m"],
+            "change_24h": data["change_24h"],
+            "funding_rate": data["funding_rate"],
+            "groq": raw_signals.get("groq"),
+            "gemini": raw_signals.get("gemini"),
+            "consensus": result,
+        }
+
+        g_bias = (raw_signals.get("groq") or {}).get("bias", "-")
+        gm_bias = (raw_signals.get("gemini") or {}).get("bias", "-")
+        log(
+            f"{symbol}: groq={g_bias} gemini={gm_bias} -> consensus={result['bias']} ({result['confidence']}%)"
+        )
+
+        trade = calculate_position(symbol, result, balance)
         if not trade:
             continue
 
@@ -389,24 +343,50 @@ def run_once():
 
         res = place_order(trade)
         if res["ok"]:
-            log(f"{symbol}: ORDER PLACED {res['order_id']} | qty={trade['qty_str']} (step={trade['qtyStep']}) entry=${trade['entry']} SL=${trade['sl']} TP=${trade['tp']} notional=${trade['notional']}")
+            log(
+                f"{symbol}: ORDER PLACED {res['order_id']} | qty={trade['qty_str']} "
+                f"entry=${trade['entry']} SL=${trade['sl']} TP=${trade['tp']} "
+                f"notional=${trade['notional']} confidence={trade['confidence']}%"
+            )
             state["trades_today"] += 1
             save_state(state)
+            try:
+                alert_trade_opened(
+                    symbol, trade["bias"], trade["entry"], trade["sl"],
+                    trade["tp"], trade["qty_str"], trade["confidence"],
+                )
+            except Exception as e:
+                log(f"telegram alert failed: {str(e)[:50]}")
             if len(positions) + state["trades_today"] >= MAX_OPEN_POSITIONS:
                 break
         else:
             log(f"{symbol}: order failed - {res['error']}")
         time.sleep(0.5)
 
+    try:
+        if signals_snapshot:
+            alert_cycle_summary(signals_snapshot, balance)
+    except Exception as e:
+        log(f"summary alert failed: {str(e)[:50]}")
+
+    with open("signals.json", "w") as f:
+        json.dump(signals_snapshot, f, indent=2, default=str)
+
     log("Cycle ended")
 
 
 def main():
     log("=" * 50)
-    log("BOT STARTED")
+    log("BOT STARTED (multi-AI consensus mode)")
     log(f"Coins: {COINS}")
     log(f"Risk/trade: {RISK_PER_TRADE_PCT}% | Max positions: {MAX_OPEN_POSITIONS}")
+    log(f"Min consensus confidence: {MIN_CONSENSUS_CONFIDENCE}%")
     log(f"Loop interval: {LOOP_INTERVAL_SEC}s")
+
+    try:
+        send_message("BOT STARTED\n\nMulti-AI consensus mode active.")
+    except Exception:
+        pass
 
     while True:
         try:
@@ -415,7 +395,7 @@ def main():
             log("Stopped by user")
             break
         except Exception as e:
-            log(f"Cycle error: {str(e)[:100]}")
+            log(f"Cycle error: {str(e)[:120]}")
         log(f"Sleeping {LOOP_INTERVAL_SEC}s...")
         time.sleep(LOOP_INTERVAL_SEC)
 
