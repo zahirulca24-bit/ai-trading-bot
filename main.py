@@ -26,7 +26,7 @@ session = HTTP(
     api_secret=os.getenv("BYBIT_API_SECRET"),
 )
 
-COINS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT"]
+COINS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "ADAUSDT", "DOGEUSDT", "AVAXUSDT", "LINKUSDT", "DOTUSDT"]
 
 RISK_PER_TRADE_PCT = 2.0
 MIN_CONSENSUS_CONFIDENCE = 60
@@ -36,7 +36,7 @@ LEVERAGE = 3
 
 # Dual speed intervals
 POSITION_CHECK_INTERVAL_SEC = 300   # 5 min - position management only
-AI_CYCLE_INTERVAL_SEC = 900         # 15 min - AI signals + new trades
+AI_CYCLE_INTERVAL_SEC = 1200         # 15 min - AI signals + new trades
 
 SL_PCT = 0.008
 TP_PCT = 0.016
