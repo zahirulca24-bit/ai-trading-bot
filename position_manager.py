@@ -72,10 +72,10 @@ def _positions():
     try:
         r = _session.get_positions(category="linear", settleCoin="USDT")
         if r["retCode"] != 0:
-            return []
+            return None
         return [p for p in r["result"]["list"] if float(p.get("size", 0)) > 0]
     except Exception:
-        return []
+        return None
 
 
 def _set_sl(symbol, sl_price, tick):
@@ -100,6 +100,9 @@ def manage_positions(log_func=None):
         (log_func or print)(m)
 
     positions = _positions()
+    if positions is None:
+        (log_func or print)("[PM] positions API unavailable; preserving state")
+        return
     state = _load_state()
     changed = False
 
@@ -133,6 +136,10 @@ def manage_positions(log_func=None):
             "locked": False,
         })
 
+        if st.get("side") != side or abs(float(st.get("entry") or 0) - entry) > max(entry * 0.000001, 1e-8):
+            st = {"entry": entry, "side": side, "original_sl": sl, "locked": False}
+            state[symbol] = st
+            changed = True
         if st.get("locked"):
             continue
 

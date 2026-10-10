@@ -2,6 +2,8 @@ import os
 import json
 import time
 import datetime
+import fcntl
+from contextlib import contextmanager
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -44,6 +46,9 @@ TP_PCT = 0.016
 STATE_FILE = "state.json"
 LOG_FILE = "bot.log"
 INSTRUMENT_CACHE = {}
+MAX_MARGIN_USAGE_PCT = 70.0
+MAX_PORTFOLIO_RISK_PCT = 6.0
+AI_LOCK_FILE = 'ai_cycle.lock'
 
 
 def log(msg):
@@ -120,6 +125,23 @@ def format_price(price, tick):
     return f"{round_step(price, tick):.{d}f}"
 
 
+def get_account():
+    """Return equity and available margin; fail closed when either is unavailable."""
+    try:
+        r = session.get_wallet_balance(accountType="UNIFIED")
+        if r.get("retCode") != 0 or not r.get("result", {}).get("list"):
+            return None
+        a = r["result"]["list"][0]
+        equity = float(a["totalEquity"])
+        available = float(a["totalAvailableBalance"])
+        if equity <= 0 or available < 0:
+            return None
+        return {"equity": equity, "available": available}
+    except Exception as e:
+        log(f"account unavailable: {e}")
+        return None
+
+
 def get_balance():
     try:
         r = session.get_wallet_balance(accountType="UNIFIED")
@@ -137,11 +159,12 @@ def get_open_positions():
     try:
         r = session.get_positions(category="linear", settleCoin="USDT")
         if r["retCode"] != 0:
-            return {}
+            log(f"positions API error: {r.get('retMsg')}")
+            return None
         return {p["symbol"]: p for p in r["result"]["list"] if float(p.get("size", 0)) > 0}
     except Exception as e:
         log(f"positions error: {e}")
-        return {}
+        return None
 
 
 def get_rsi(symbol, interval="15", period=14):
@@ -213,11 +236,12 @@ def calculate_position(symbol, signal, balance):
         return None
 
     raw_qty = risk_usd / price_risk
-    qty = round_step(raw_qty, info["qtyStep"])
-
+    import math
+    qty = round(math.floor(raw_qty / info["qtyStep"]) * info["qtyStep"],
+                decimals_from_step(info["qtyStep"]))
     if qty < info["minOrderQty"]:
-        qty = info["minOrderQty"]
-        log(f"{symbol}: qty raised to minOrderQty {info['minOrderQty']}")
+        log(f"{symbol}: quantity under exchange minimum; skip")
+        return None
 
     notional = qty * entry
     if notional < info["minNotional"]:
@@ -234,7 +258,7 @@ def calculate_position(symbol, signal, balance):
         "qty": qty,
         "qty_str": format_qty(qty, info["qtyStep"]),
         "notional": round(notional, 2),
-        "risk_usd": round(risk_usd, 2),
+        "risk_usd": round(qty * price_risk, 2),
         "tickSize": info["tickSize"],
         "qtyStep": info["qtyStep"],
     }
@@ -272,6 +296,21 @@ def place_order(t):
     except Exception as e:
         return {"ok": False, "error": str(e)[:80]}
 
+
+
+def verify_entry_fill(symbol, order_id, step):
+    """Get executed order quantity instead of assuming requested size filled."""
+    for _ in range(6):
+        try:
+            r = session.get_order_history(category="linear", symbol=symbol, orderId=order_id, limit=1)
+            if r.get("retCode") == 0 and r.get("result", {}).get("list"):
+                order = r["result"]["list"][0]
+                if order.get("orderStatus") in ("Filled", "PartiallyFilledCanceled", "Cancelled", "Rejected"):
+                    return round_step(float(order.get("cumExecQty") or 0), step)
+        except Exception as e:
+            log(f"{symbol}: fill check error: {str(e)[:70]}")
+        time.sleep(0.5)
+    return None
 
 
 def place_order_with_tps(t):
@@ -335,6 +374,23 @@ def place_order_with_tps(t):
             return {"ok": False, "error": r["retMsg"]}
 
         order_id = r["result"]["orderId"]
+        filled_qty = verify_entry_fill(symbol, order_id, step)
+        if filled_qty is None or filled_qty <= 0:
+            return {"ok": False, "order_id": order_id,
+                    "error": "Entry status unverified; inspect exchange immediately"}
+        qty1 = round_step(filled_qty * 0.40, step)
+        qty2 = round_step(filled_qty * 0.30, step)
+        qty3 = round_step(filled_qty - qty1 - qty2, step)
+        if min(qty1, qty2, qty3) < info["minOrderQty"]:
+            try:
+                fallback = session.set_trading_stop(
+                    category="linear", symbol=symbol, positionIdx=0,
+                    takeProfit=format_price(t["tp"], tick), tpTriggerBy="LastPrice")
+                if fallback.get("retCode") == 0:
+                    return {"ok": True, "order_id": order_id, "tps": ["full TP"]}
+            except Exception as e:
+                log(f"{symbol}: TP fallback error: {e}")
+            return {"ok": False, "order_id": order_id, "error": "Entry filled; TP fallback failed"}
 
         # 2. Set TP limit orders (reduceOnly)
         tp_results = []
@@ -360,6 +416,9 @@ def place_order_with_tps(t):
                 tp_results.append(f"{label}=FAIL({tr['retMsg'][:30]})")
 
         log(f"{symbol}: TPs set -> {' | '.join(tp_results)}")
+        if any("FAIL(" in result for result in tp_results):
+            return {"ok": False, "order_id": order_id, "tps": tp_results,
+                    "error": "Entry filled; partial TP setup failed, reconcile manually"}
         return {"ok": True, "order_id": order_id, "tps": tp_results}
 
     except Exception as e:
@@ -380,16 +439,39 @@ def position_check():
 # ========================================================
 # AI Cycle - every 15 minutes
 # ========================================================
+@contextmanager
+def exclusive_ai_cycle():
+    with open(AI_LOCK_FILE, "a+") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+
+
 def ai_cycle():
+    with exclusive_ai_cycle() as acquired:
+        if acquired:
+            _ai_cycle_unlocked()
+        else:
+            log("AI cycle already active; skip")
+
+
+def _ai_cycle_unlocked():
     """AI signals + new trades"""
     log("=" * 50)
     log("AI Cycle started")
 
     state = load_state()
-    balance = get_balance()
-    if balance is None:
-        log("balance fetch failed, skip AI cycle")
+    account = get_account()
+    if account is None:
+        log("equity or available margin unavailable, skip AI cycle")
         return
+    balance = account["equity"]
 
     if state["start_balance"] is None:
         state["start_balance"] = balance
@@ -408,6 +490,9 @@ def ai_cycle():
         return
 
     positions = get_open_positions()
+    if positions is None:
+        log("Positions unknown, abort new trades")
+        return
     log(f"Open positions: {len(positions)} -> {list(positions.keys())}")
 
     if len(positions) >= MAX_OPEN_POSITIONS:
@@ -451,7 +536,31 @@ def ai_cycle():
         if not trade:
             continue
 
-        set_leverage(symbol)
+        positions = get_open_positions()
+        account = get_account()
+        if positions is None or account is None:
+            log("Exchange unavailable: abort cycle")
+            break
+        if symbol in positions or len(positions) >= MAX_OPEN_POSITIONS:
+            continue
+        existing_risk = 0.0
+        for p in positions.values():
+            entry_p = float(p.get("avgPrice") or 0)
+            sl_p = float(p.get("stopLoss") or 0)
+            qty_p = float(p.get("size") or 0)
+            if not entry_p or not sl_p or not qty_p:
+                existing_risk = float("inf")
+                break
+            existing_risk += abs(entry_p - sl_p) * qty_p
+        if existing_risk + trade["risk_usd"] > account["equity"] * MAX_PORTFOLIO_RISK_PCT / 100:
+            log(f"{symbol}: portfolio risk cap hit")
+            continue
+        if trade["notional"] > account["available"] * LEVERAGE * MAX_MARGIN_USAGE_PCT / 100:
+            log(f"{symbol}: insufficient margin headroom")
+            continue
+        if not set_leverage(symbol):
+            log(f"{symbol}: leverage setup failed")
+            continue
         time.sleep(0.3)
 
         res = place_order_with_tps(trade)
@@ -470,10 +579,14 @@ def ai_cycle():
                 )
             except Exception as e:
                 log(f"telegram alert failed: {str(e)[:50]}")
-            if len(positions) + state["trades_today"] >= MAX_OPEN_POSITIONS:
+            refreshed = get_open_positions()
+            if refreshed is None or len(refreshed) >= MAX_OPEN_POSITIONS:
                 break
         else:
             log(f"{symbol}: order failed - {res['error']}")
+            if res.get("order_id"):
+                alert_error(f"{symbol}: entry accepted but TP or fill confirmation failed: {res['error']}")
+                break
         time.sleep(0.5)
 
     try:

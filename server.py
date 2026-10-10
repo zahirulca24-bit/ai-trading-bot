@@ -2,7 +2,9 @@
 import threading
 import time
 import datetime
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request
+from functools import wraps
+import hmac
 
 from main import run_once, get_balance, get_open_positions, log
 from telegram_bot import send_message
@@ -13,6 +15,7 @@ BOT_THREAD = None
 BOT_RUNNING = False
 LAST_CYCLE = None
 LOOP_INTERVAL = 900
+TRIGGER_TOKEN = os.getenv('TRIGGER_TOKEN')
 
 
 def bot_loop():
@@ -62,6 +65,8 @@ def status():
     try:
         balance = get_balance()
         positions = get_open_positions()
+        if balance is None or positions is None:
+            return jsonify({"ok": False, "error": "exchange unavailable"}), 503
         return jsonify({
             "ok": True,
             "balance_usdt": balance,
@@ -74,7 +79,18 @@ def status():
         return jsonify({"ok": False, "error": str(e)[:100]}), 500
 
 
-@app.route("/trigger")
+def authorized_trigger(func):
+    @wraps(func)
+    def checked(*args, **kwargs):
+        supplied = request.headers.get("Authorization", "")
+        if not TRIGGER_TOKEN or not hmac.compare_digest(supplied, "Bearer " + TRIGGER_TOKEN):
+            return jsonify({"ok": False, "error": "unauthorized"}), 401
+        return func(*args, **kwargs)
+    return checked
+
+
+@app.route("/trigger", methods=["POST"])
+@authorized_trigger
 def trigger():
     try:
         threading.Thread(target=run_once, daemon=True).start()
